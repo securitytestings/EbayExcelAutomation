@@ -1,0 +1,282 @@
+function main(workbook: ExcelScript.Workbook) {
+    const sheet = workbook.getActiveWorksheet();
+    const used = sheet.getUsedRange();
+
+    const headerRowIndex = used.getRowIndex();
+    const dataStartRow = headerRowIndex + 1;
+
+    console.log(`Header row detected at Excel row ${headerRowIndex + 1}`);
+    console.log(`Data starts at Excel row ${dataStartRow + 1}`);
+
+    const headers = sheet
+        .getRangeByIndexes(headerRowIndex, 0, 1, used.getColumnCount())
+        .getValues()[0]
+        .map(h => h == null ? "" : String(h).trim().toUpperCase());
+
+    function normalizeType(v: string | number | null | undefined): string {
+        return v == null ? "" : String(v).trim().toUpperCase();
+    }
+
+    function normalizeCode(v: string | number | null | undefined): string {
+        return v == null ? "" : String(v).replace(/\s+/g, "").toUpperCase();
+    }
+
+    function isVat(v: number, target: number) {
+        return Math.abs(v - target) < 0.0001; // 0.0001 to make sure we don't get 21% or 19%, which happened before :D
+    }
+
+    function requireColumn(headerName: string): number {
+        const idx = headers.indexOf(headerName.toUpperCase());
+        if (idx === -1) {
+            throw new Error(`Required column not found: "${headerName}"`);
+        }
+        console.log(`"${headerName}" found at column ${idx + 1}`);
+        return idx;
+    }
+
+    // You can change these columns to your desired pickings, or add more here!
+    const COUNTRY_COL = requireColumn("Post to country");
+    const VAT_COL = requireColumn("Seller specified VAT rate");
+    const CURRENCY_COL = requireColumn("Transaction currency");
+    //
+
+    const data = sheet
+        .getRangeByIndexes(
+            dataStartRow,
+            0,
+            used.getRowCount() - (dataStartRow - headerRowIndex),
+            used.getColumnCount()
+        )
+        .getValues() as (string | number)[][];
+
+
+
+    type Bucket = {
+        gross: number;
+        fees: number;
+        net: number;
+        eurNet?: number;
+    };
+
+    const buckets: Record<string, Bucket> = {
+        "GB_T0_GBP": { gross: 0, fees: 0, net: 0 },
+        "GB_T20_GBP": { gross: 0, fees: 0, net: 0 },
+        "DE_T0_GBP": { gross: 0, fees: 0, net: 0 },
+        "OTHER_T0_GBP": { gross: 0, fees: 0, net: 0 },
+        "OTHER_T20_GBP": { gross: 0, fees: 0, net: 0 },
+        "GB_T0_EUR": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "DE_T0_EUR": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "OTHER_T20_EUR": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "OTHER_T0_EUR": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "DE_T0_USD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "OTHER_T0_USD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "OTHER_T0_AUD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+
+        "CLAIM_GB_T0_GBP": { gross: 0, fees: 0, net: 0 },
+        "CLAIM_DE_T0_GBP": { gross: 0, fees: 0, net: 0 },
+        "CLAIM_T0_AUD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "CLAIM_T0_EUR": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "CLAIM_T0_USD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+
+        "REFUND_GB_T0_GBP": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "REFUND_DE_T0_GBP": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "REFUND_T0_AUD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "REFUND_T0_EUR": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+        "REFUND_T0_USD": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+
+        "PAYMENT_DISPUTE_T0_GBP": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+
+        "POSTAGE_LABEL_T0_GBP": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+
+        "OTHER_FEES_T0_GBP": { gross: 0, fees: 0, net: 0, eurNet: 0 },
+
+        // Format: "EXAMPLE_T0": { gross: 0, fees: 0, net: 0 }, (For NO FX Conversion)
+        // Format (FX): "EXAMPLE_T0": { gross: 0, fees: 0, net: 0, eurNet: 0 }, 
+    };
+
+    for (const row of data) {
+        const type = normalizeType(row[1]);
+        if (type !== "ORDER" && type !== "CLAIM" && type !== "REFUND" && type !== "PAYMENT DISPUTE" && type !== "POSTAGE LABEL" && type !== "OTHER FEE") // Didn't make this too pretty, add types if you'd like here.
+
+             continue;
+
+
+        const country = normalizeCode(row[COUNTRY_COL]);
+
+        const rawVat = row[VAT_COL];
+        let vat = 0;
+
+        if (typeof rawVat === "string") {
+            if (rawVat.includes("%")) {
+                vat = Number(rawVat.replace("%", "").trim()) / 100;
+            } else {
+                vat = Number(rawVat.trim());
+                if (vat > 1) vat = vat / 100; // handle "20" as 20%
+            }
+        } else if (typeof rawVat === "number") {
+            vat = rawVat > 1 ? rawVat / 100 : rawVat;
+        } else {
+            vat = 0;
+        }
+
+        
+        const currency = normalizeCode(row[CURRENCY_COL]);
+
+        let key: string | null = null;
+
+        // ===== PAYMENT DISPUTE =====
+
+        if (type === "PAYMENT DISPUTE" &&
+            isVat(vat, 0) &&
+            currency === "GBP") {
+            key = "PAYMENT_DISPUTE_T0_GBP";
+        }
+        
+        // ===== POSTAGE LABEL =====
+
+        if (type === "POSTAGE LABEL" && isVat(vat, 0) && currency === "GBP") {
+            key = "POSTAGE_LABEL_T0_GBP";
+        }
+
+        // ===== REFUND =====
+        
+        if (type === "REFUND" && isVat(vat, 0)) {
+
+            if (currency === "GBP") {
+                if (country === "GB") key = "REFUND_GB_T0_GBP";
+                else if (country === "DE") key = "REFUND_DE_T0_GBP";
+            }
+
+            else if (currency === "AUD") {
+                key = "REFUND_T0_AUD";
+            }
+
+            else if (currency === "EUR") {
+                key = "REFUND_T0_EUR";
+            }
+
+            else if (currency === "USD") {
+                key = "REFUND_T0_USD";
+            }
+        }
+
+        // ===== OTHER FEES =====
+
+        if (type === "OTHER FEE" && isVat(vat, 0) && currency === "GBP") {
+            key = "OTHER_FEES_T0_GBP";
+        }
+
+        // ===== CLAIMS =====
+        if (type === "CLAIM" && isVat(vat, 0)) {
+            if (currency === "GBP") {
+                if (country === "GB") key = "CLAIM_GB_T0_GBP";
+                else if (country === "DE") key = "CLAIM_DE_T0_GBP";
+            } else if (currency === "AUD") {
+                key = "CLAIM_T0_AUD";
+            } else if (currency === "EUR") {
+                key = "CLAIM_T0_EUR";
+            } else if (currency === "USD") {
+                key = "CLAIM_T0_USD";
+            }
+        }
+
+        // ===== ORDERS =====
+        else if (type === "ORDER") {
+            if (currency === "GBP") {
+                if (country === "GB" && isVat(vat, 0)) key = "GB_T0_GBP";
+                else if (country === "GB" && isVat(vat, 0.2)) 
+                key = "GB_T20_GBP";
+                else if (country === "DE" && isVat(vat, 0)) key = "DE_T0_GBP";
+                else if (country !== "GB" && isVat(vat, 0.2)) key = "OTHER_T20_GBP";
+            }
+            else if (currency === "EUR"){
+                if (country === "GB" && isVat(vat, 0)) key = "GB_T0_EUR";
+                else if (country === "DE" && isVat(vat, 0)) key = "DE_T0_EUR";
+                else if (country !== "GB" && isVat(vat, 0.2)) key = "OTHER_T20_EUR";
+                else if (country !== "GB" && isVat(vat, 0))
+                key = "OTHER_T0_EUR";
+            }
+            else if (currency === "USD") {
+                if (country === "DE" && isVat(vat, 0)) key = "DE_T0_USD";
+                else if (country !== "GB" && isVat(vat, 0))
+                key = "OTHER_T0_USD";
+            }
+            else if (currency === "AUD" && isVat(vat, 0) && country !== "GB") {
+                key = "OTHER_T0_AUD";
+            }
+        }
+
+        if (!key) continue;
+
+        const bucket = buckets[key];
+
+        const gross = typeof row[33] === "number" ? row[33] : 0;
+        bucket.gross += gross;
+
+        let fees = 0;
+        for (let c = 27; c <= 32; c++) {
+            if (typeof row[c] === "number") fees += Math.abs(row[c] as number);
+        }
+
+        bucket.fees += fees;
+        bucket.net += gross - fees;
+
+        if ("eurNet" in bucket && typeof row[10] === "number") {
+            bucket.eurNet! += row[10];
+        }
+    }
+
+    const labels: Record<string, string> = {
+        "GB_T0_GBP": "ORDERS GBP GB T0%",
+        "GB_T20_GBP": "ORDERS GBP GB T20%",
+        "DE_T0_GBP": "ORDERS GBP GERMANY T0%",
+        "OTHER_T0_GBP": "ORDERS GBP OTHER COUNTRIES T0%",
+        "OTHER_T20_GBP": "ORDERS GBP OTHER COUNTRIES T20%",
+        "GB_T0_EUR": "ORDERS GBP T0% EURO (GB)",
+        "DE_T0_EUR": "ORDERS GERMANY T0% EURO",
+        "OTHER_T0_EUR": "ORDERS OTHER COUNTRIES T0% EURO",
+        "DE_T0_USD": "ORDERS GERMANY T0% USD",
+        "OTHER_T0_USD": "ORDERS OTHER COUNTRIES T0% USD",
+        "OTHER_T0_AUD": "ORDERS OTHER COUNTRIES T0% AUD",
+        "OTHER_T20_EUR": "ORDERS GBP OTHER COUNTRIES T20% EURO",
+        "CLAIM_GB_T0_GBP": "CLAIMS GBP GB T0%",
+        "CLAIM_DE_T0_GBP": "CLAIMS GBP GERMANY T0%",
+        "CLAIM_T0_AUD": "CLAIMS T0% AUD",
+        "CLAIM_T0_EUR": "CLAIMS T0% EUR",
+        "CLAIM_T0_USD": "CLAIMS T0% USD",
+
+        "REFUND_GB_T0_GBP": "REFUNDS GB T0%",
+        "REFUND_DE_T0_GBP": "REFUNDS GERMANY T0%",
+        "REFUND_T0_AUD": "REFUNDS T0% AUD",
+        "REFUND_T0_EUR": "REFUNDS T0% EURO",
+        "REFUND_T0_USD": "REFUNDS T0% USD",
+
+        "PAYMENT_DISPUTE_T0_GBP": "PAYMENT DISPUTES GBP T0%",
+
+        "POSTAGE_LABEL_T0_GBP": "POSTAGE LABEL GBP T0%",
+
+        "OTHER_FEES_T0_GBP": "OTHER FEES GBP T0%",
+
+        // FORMAT: "EXAMPLE_T0": "THIS IS AN EXAMPLE, T0%",
+    };
+
+    // OUTPUT
+    for (const [key, b] of Object.entries(buckets)) {
+        const title = labels[key] ?? key;
+
+        console.log(title);
+        console.log("Total Gross: £" + b.gross.toFixed(2));
+        console.log("Total Fees: £" + b.fees.toFixed(2));
+        console.log("Total Net: £" + b.net.toFixed(2));
+
+        if (b.eurNet !== undefined && b.eurNet !== 0) {
+            const rate = b.net / b.eurNet;
+            console.log("Conversion Rate (GBP / EUR): " + rate.toFixed(6));
+            console.log("Converted Net: £" + (b.net * rate).toFixed(2));
+            
+        }
+
+        console.log("Completed.");
+    }
+}
+
